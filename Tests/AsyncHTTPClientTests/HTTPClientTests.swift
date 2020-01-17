@@ -949,4 +949,33 @@ class HTTPClientTests: XCTestCase {
             XCTAssertNil(response?.body)
         }
     }
+    
+    func testGetwithBind() throws {
+        let httpBin = HTTPBin()
+        let httpClient = HTTPClient(eventLoopGroupProvider: .createNew,
+                                    configuration: HTTPClient.Configuration(bindToIp: "127.0.0.1"))
+        defer {
+            XCTAssertNoThrow(try httpClient.syncShutdown())
+            XCTAssertNoThrow(try httpBin.shutdown())
+        }
+
+        let response = try httpClient.get(url: "http://localhost:\(httpBin.port)/get").wait()
+        XCTAssertEqual(.ok, response.status)
+    }
+    
+    func testGetwithInvalidBind() throws {
+        let httpBin = HTTPBin()
+        let httpClient = HTTPClient(eventLoopGroupProvider: .createNew,
+                                    configuration: HTTPClient.Configuration(bindToIp: "127.0.0.2"))
+        defer {
+            XCTAssertNoThrow(try httpClient.syncShutdown())
+            XCTAssertNoThrow(try httpBin.shutdown())
+        }
+        
+        XCTAssertThrowsError(try httpClient.get(url: "http://localhost:\(httpBin.port)/get").wait(), "should throw") { error in
+            XCTAssertEqual(error as! HTTPClientError, HTTPClientError.bindFailed)
+        }
+
+    }
 }
+

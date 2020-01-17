@@ -281,16 +281,64 @@ public class HTTPClient {
             bootstrap = bootstrap.connectTimeout(timeout)
         }
 
-        let address = self.resolveAddress(request: request, proxy: self.configuration.proxy)
-        bootstrap.connect(host: address.host, port: address.port)
-            .map { channel in
-                task.setChannel(channel)
+        if self.configuration.bindToIp != nil {
+            /// prepare local socket
+            let local_sa = try! SocketAddress(ipAddress: self.configuration.bindToIp!, port: 0)
+            let local_socket = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP)
+            /// bind socket to local address
+            let bind_result = local_sa.withSockAddr { (local_sa_ptr: UnsafePointer<sockaddr>, size: Int) -> Int32 in
+                let retval = Darwin.bind(local_socket, local_sa_ptr, socklen_t(size))
+                return retval
+            }
+            if bind_result == -1 {
+                /// let err = String(cString: strerror(errno))
+                task.promise.fail(HTTPClientError.bindFailed)
+                return task
+            }
+            
+            /// create remote socket address
+            var address = self.resolveAddress(request: request, proxy: self.configuration.proxy)
+            let (status, resolved_name) = simplistic_resolver(address.host)
+            if status != nil {
+                /// resolution failed
+                task.promise.fail(HTTPClientError.connectFailed)
+                return task
+            }
+            address.host = resolved_name
+            let remote_sa = try! SocketAddress(ipAddress: address.host, port: address.port)
+            
+            /// connect socket to remote address
+            let connect_result = remote_sa.withSockAddr { (remote_sa_prt: UnsafePointer<sockaddr>, size: Int) -> Int32 in
+                let retval = connect(local_socket, remote_sa_prt, socklen_t(size))
+                return retval
+            }
+            if connect_result == -1 {
+                /// let err = String(cString: strerror(errno))
+                task.promise.fail(HTTPClientError.connectFailed)
+                return task
+            }
+            
+            bootstrap.withConnectedSocket(descriptor: local_socket)
+                .map { channel in
+                    task.setChannel(channel)
             }
             .flatMap { channel in
                 channel.writeAndFlush(request)
             }
             .cascadeFailure(to: task.promise)
-        return task
+            return task
+        } else {
+            let address = self.resolveAddress(request: request, proxy: self.configuration.proxy)
+            bootstrap.connect(host: address.host, port: address.port)
+                .map { channel in
+                    task.setChannel(channel)
+            }
+            .flatMap { channel in
+                channel.writeAndFlush(request)
+            }
+            .cascadeFailure(to: task.promise)
+            return task
+        }
     }
 
     private func resolve(timeout: TimeAmount?, deadline: NIODeadline?) -> TimeAmount? {
@@ -338,19 +386,23 @@ public class HTTPClient {
         public var decompression: Decompression
         /// Ignore TLS unclean shutdown error, defaults to `false`.
         public var ignoreUncleanSSLShutdown: Bool
+        /// Bind to provided source IP
+        public var bindToIp : String?
 
         public init(tlsConfiguration: TLSConfiguration? = nil,
                     redirectConfiguration: RedirectConfiguration? = nil,
                     timeout: Timeout = Timeout(),
                     proxy: Proxy? = nil,
                     ignoreUncleanSSLShutdown: Bool = false,
-                    decompression: Decompression = .disabled) {
+                    decompression: Decompression = .disabled,
+                    bindToIp: String? = nil) {
             self.tlsConfiguration = tlsConfiguration
             self.redirectConfiguration = redirectConfiguration ?? RedirectConfiguration()
             self.timeout = timeout
             self.proxy = proxy
             self.ignoreUncleanSSLShutdown = ignoreUncleanSSLShutdown
             self.decompression = decompression
+            self.bindToIp = bindToIp
         }
 
         public init(certificateVerification: CertificateVerification,
@@ -358,13 +410,15 @@ public class HTTPClient {
                     timeout: Timeout = Timeout(),
                     proxy: Proxy? = nil,
                     ignoreUncleanSSLShutdown: Bool = false,
-                    decompression: Decompression = .disabled) {
+                    decompression: Decompression = .disabled,
+                    bindToIp: String? = nil) {
             self.tlsConfiguration = TLSConfiguration.forClient(certificateVerification: certificateVerification)
             self.redirectConfiguration = redirectConfiguration ?? RedirectConfiguration()
             self.timeout = timeout
             self.proxy = proxy
             self.ignoreUncleanSSLShutdown = ignoreUncleanSSLShutdown
             self.decompression = decompression
+            self.bindToIp = bindToIp
         }
     }
 
@@ -526,6 +580,8 @@ public struct HTTPClientError: Error, Equatable, CustomStringConvertible {
         case proxyAuthenticationRequired
         case redirectLimitReached
         case redirectCycleDetected
+        case bindFailed
+        case connectFailed
     }
 
     private var code: Code
@@ -568,4 +624,47 @@ public struct HTTPClientError: Error, Equatable, CustomStringConvertible {
     public static let redirectLimitReached = HTTPClientError(code: .redirectLimitReached)
     /// Redirect Cycle detected.
     public static let redirectCycleDetected = HTTPClientError(code: .redirectCycleDetected)
+    /// Binding to local addres failed.
+    public static let bindFailed = HTTPClientError(code: .bindFailed)
+    /// Socket connection failed.
+    public static let connectFailed = HTTPClientError(code: .connectFailed)
+}
+
+// Simplest DNS resolver possible
+func simplistic_resolver(_ name: String) -> (Error?,String) {
+    var info: UnsafeMutablePointer<addrinfo>?
+    var hint = addrinfo()
+    
+    hint.ai_socktype = Darwin.SOCK_STREAM
+    hint.ai_protocol = Darwin.IPPROTO_TCP
+    guard getaddrinfo(name, "0", &hint, &info) == 0 else {
+        return (SocketAddressError.unknown(host: name, port: 0), name)
+    }
+    
+    if let info = info {
+        /// cycle through resolved addresses, return first "good one"
+        var item: UnsafeMutablePointer<addrinfo> = info as UnsafeMutablePointer<addrinfo>
+        while true {
+            switch item.pointee.ai_family {
+            case AF_INET:
+                if let resolved_sockaddr = item.pointee.ai_addr {
+                    let result = resolved_sockaddr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) {ptr in
+                        return SocketAddress(ptr.pointee, host: name).ipAddress
+                    }
+                    freeaddrinfo(info)
+                    return (nil,result!)
+                }
+            default:
+                guard let nextItem = item.pointee.ai_next else {
+                    /// no more resolved addresses
+                    freeaddrinfo(info)
+                    return (SocketAddressError.unknown(host: name, port: 0), name)
+                }
+                item = nextItem
+            }
+        }
+    } else {
+        /* this is odd, getaddrinfo returned NULL */
+        return (SocketAddressError.unsupported, name)
+    }
 }
