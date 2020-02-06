@@ -301,7 +301,7 @@ public class HTTPClient {
             let (status, resolved_name) = simplistic_resolver(address.host)
             if status != nil {
                 /// resolution failed
-                task.promise.fail(HTTPClientError.connectFailed)
+                task.promise.fail(HTTPClientError.dnsFailed)
                 return task
             }
             address.host = resolved_name
@@ -582,6 +582,7 @@ public struct HTTPClientError: Error, Equatable, CustomStringConvertible {
         case redirectCycleDetected
         case bindFailed
         case connectFailed
+        case dnsFailed
     }
 
     private var code: Code
@@ -628,6 +629,8 @@ public struct HTTPClientError: Error, Equatable, CustomStringConvertible {
     public static let bindFailed = HTTPClientError(code: .bindFailed)
     /// Socket connection failed.
     public static let connectFailed = HTTPClientError(code: .connectFailed)
+    /// DNS name resolution failed.
+    public static let dnsFailed = HTTPClientError(code: .dnsFailed)
 }
 
 // Simplest DNS resolver possible
